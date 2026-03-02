@@ -1,0 +1,17 @@
+checkpoints/
+retrain_checkpoints/
+.venv/
+.ruff_cache/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.DS_Store
+.idea/
+.vscode/
+*.log
