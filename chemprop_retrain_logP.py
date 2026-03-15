@@ -19,7 +19,7 @@ from rdkit import Chem
 from rdkit.Chem.MolStandardize import rdMolStandardize
 
 from sklearn.preprocessing import StandardScaler
-
+import sys
 import pandas as pd
 
 PIPELINE_PHYSCHEM = Pipeline(
@@ -76,11 +76,23 @@ def process_file(
 ) -> tuple[list[str], list[float]]:
     df = pd.read_csv(input_path)
 
+    # Select only the columns we need and ensure they exist
+    if smiles_col not in df.columns or logp_col not in df.columns:
+        raise ValueError(
+            f"Required columns '{smiles_col}' and/or '{logp_col}' not found in data"
+        )
+
+    # Ensure we're working with a DataFrame
     results = df[[smiles_col, logp_col]].copy()
-    results["standardized_smiles"] = results[smiles_col].apply(standardize_smiles)
+    results["standardized_smiles"] = [
+        standardize_smiles(str(x)) if pd.notnull(x) else None
+        for x in results[smiles_col]
+    ]
     results = results.dropna(subset=["standardized_smiles"])
 
-    return results["standardized_smiles"].tolist(), results[logp_col].tolist()
+    return results["standardized_smiles"].tolist(), [
+        float(y) for y in results[logp_col]
+    ]
 
 
 def load_checkpoint_for_retraining(checkpoint_path: str):
@@ -94,68 +106,24 @@ def freeze_message_passing_layers(mpnn: models.MPNN):
             param.requires_grad = False
 
 
-def get_original_learning_rate(checkpoint_path: str) -> float:
-    checkpoint = torch.load(checkpoint_path, weights_only=False)
-    hparams = checkpoint.get("hyper_parameters", {})
-    if "init_lr" in hparams:
-        return hparams["init_lr"]
-    if "learning_rate" in hparams:
-        return hparams["learning_rate"]
-    return 1e-4
+additional_data = "/Volumes/External/data/logP/logP_without_overlap.csv"
+smiles_col = "smiles"
+target_col = "logP"
+checkpoint = "/retrain_checkpoints/last.ckpt"
+original_lr = 1e-5
+output_dir = "out"
+epochs = 50
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Retrain a chemprop model with additional data"
-    )
-    parser.add_argument(
-        "--checkpoint-path", required=True, help="Path to existing model checkpoint"
-    )
-    parser.add_argument(
-        "--additional-data",
-        required=True,
-        help="Path to CSV with additional training data",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default="retrain_checkpoints",
-        help="Output directory for checkpoints",
-    )
-    parser.add_argument(
-        "--epochs", type=int, default=4, help="Number of epochs to train"
-    )
-    parser.add_argument(
-        "--val-split", type=float, default=0.1, help="Validation set fraction"
-    )
-    parser.add_argument(
-        "--test-split", type=float, default=0.1, help="Test set fraction"
-    )
-    parser.add_argument(
-        "--lr-multiplier",
-        type=float,
-        default=0.1,
-        help="Learning rate multiplier (default: 0.1 = 10x lower)",
-    )
-    parser.add_argument(
-        "--smiles-col",
-        default="smiles",
-        help="SMILES column name in additional data",
-    )
-    parser.add_argument(
-        "--target-col",
-        default="logP",
-        help="Target column name in additional data",
-    )
-
-    args = parser.parse_args()
+    import argparse
 
     print(f"Loading original data from {ORIGINAL_DATA_PATH}...")
     orig_smis, orig_ys = process_file(ORIGINAL_DATA_PATH)
     print(f"  Loaded {len(orig_smis)} original molecules")
 
-    print(f"Loading additional data from {args.additional_data}...")
     add_smis, add_ys = process_file(
-        args.additional_data, smiles_col=args.smiles_col, logp_col=args.target_col
+        additional_data, smiles_col=smiles_col, logp_col=target_col
     )
     print(f"  Loaded {len(add_smis)} additional molecules")
 
@@ -167,17 +135,17 @@ def main():
     mols = [make_mol(smi, add_h=True, keep_h=True) for smi in all_smis]
     x_ds_unscaled = pd.DataFrame(PIPELINE_PHYSCHEM.transform(all_smis))
 
-    train_frac = 1.0 - args.val_split - args.test_split
+    train_frac = 1.0 - 0.1 - 0.1
     train_indices_list, val_indices_list, test_indices_list = data.make_split_indices(
-        mols, "random", (train_frac, args.val_split, args.test_split)
-    )
+         mols, "random", (train_frac, 0.1, 0.1)
+     )
     train_indices = [list(train_indices_list[0])]
     val_indices = [list(val_indices_list[0])]
     test_indices = [list(test_indices_list[0])]
 
     print(
-        f"Split: {len(train_indices[0])} train, {len(val_indices[0])} val, {len(test_indices[0])} test"
-    )
+         f"Split: {len(train_indices[0])} train, {len(val_indices[0])} val, {len(test_indices[0])} test"
+     )
 
     x_d_scaler = StandardScaler()
     train_x_ds = [x_ds_unscaled.iloc[i].values for i in train_indices[0]]
@@ -187,29 +155,28 @@ def main():
     X_d_transform = nn.ScaleTransform.from_standard_scaler(x_d_scaler)
 
     all_data = [
-        data.MoleculeDatapoint(mol, name=smi, y=np.array([y]), x_d=np.array(x_d))
-        for mol, smi, y, x_d in zip(mols, all_smis, all_ys, x_ds.values)
-    ]
+         data.MoleculeDatapoint(mol, name=smi, y=np.array([y]), x_d=np.array(x_d))
+         for mol, smi, y, x_d in zip(mols, all_smis, all_ys, x_ds.values)
+     ]
 
     train_data, val_data, test_data = data.split_data_by_indices(
-        all_data, train_indices, val_indices, test_indices
-    )
+         all_data, train_indices, val_indices, test_indices
+     )
 
     featurizer = featurizers.SimpleMoleculeMolGraphFeaturizer()
 
     train_dset = data.MoleculeDataset(train_data[0], featurizer)
     val_dset = data.MoleculeDataset(val_data[0], featurizer)
     test_dset = data.MoleculeDataset(test_data[0], featurizer)
-    train_loader = data.build_dataloader(train_dset, num_workers=1)
-    val_loader = data.build_dataloader(val_dset, num_workers=1, shuffle=False)
-    test_loader = data.build_dataloader(test_dset, num_workers=1, shuffle=False)
+    train_loader = data.build_dataloader(train_dset, num_workers=0)
+    val_loader = data.build_dataloader(val_dset, num_workers=0, shuffle=False)
+    test_loader = data.build_dataloader(test_dset, num_workers=0, shuffle=False)
 
-    print(f"Loading checkpoint from {args.checkpoint_path}...")
-    mpnn = load_checkpoint_for_retraining(args.checkpoint_path)
+    print(f"Loading checkpoint from {checkpoint}...")
+    mpnn = load_checkpoint_for_retraining(checkpoint)
     mpnn.X_d_transform = X_d_transform
 
-    original_lr = get_original_learning_rate(args.checkpoint_path)
-    new_lr = original_lr * args.lr_multiplier
+    new_lr = original_lr * 0.1
     print(f"Original LR: {original_lr}, New LR: {new_lr}")
 
     print("Freezing message passing layers...")
@@ -225,10 +192,10 @@ def main():
 
     mpnn.configure_optimizers = new_configure_optimizers
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
     checkpointing = ModelCheckpoint(
-        args.output_dir,
+        output_dir,
         "best-{epoch}-{val_loss:.2f}",
         "val_loss",
         mode="min",
@@ -241,11 +208,11 @@ def main():
         enable_progress_bar=True,
         accelerator="auto",
         devices=1,
-        max_epochs=args.epochs,
+        max_epochs=50,
         callbacks=[checkpointing],
     )
 
-    print(f"Starting training for {args.epochs} epochs...")
+    print(f"Starting training for {epochs} epochs...")
     trainer.fit(mpnn, train_loader, val_loader)
 
     results = trainer.test(dataloaders=test_loader, weights_only=False)
